@@ -40,3 +40,4 @@ fpk/app/
 TASK_*.md
 .tasks_archive/
 .cursor/
+/media-cache/

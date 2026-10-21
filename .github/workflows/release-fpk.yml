@@ -1,0 +1,76 @@
+name: Build and publish FPK release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate release tag
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_REF_TYPE" != "tag" ]]; then
+            echo "Run this workflow on a version tag (for example v2.9.32)."
+            exit 1
+          fi
+          version="${RELEASE_VERSION#v}"
+          test "$version" = "$(tr -d '[:space:]' < VERSION)"
+          grep -Eq "^version[[:space:]]*=[[:space:]]*$version$" fpk/manifest
+
+      - name: Build and validate FPK
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: ./build_fpk.sh --version "${RELEASE_VERSION#v}" --skip-icons
+
+      - name: Prepare release notes
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"].removeprefix("v")
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          heading = f"## [{version}]"
+          start = changelog.find(heading)
+          if start < 0:
+              raise SystemExit(f"No changelog section found for {version}")
+          end = changelog.find("\n## [", start + len(heading))
+          notes = changelog[start:] if end < 0 else changelog[start:end]
+          Path(os.environ["RUNNER_TEMP"], "release-notes.md").write_text(
+              notes.strip() + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.ref_name }}
+        run: >-
+          gh release create "$RELEASE_REF"
+          "dist/fnmusicext-${RELEASE_REF#v}.fpk"
+          --title "fnmusicext ${RELEASE_REF}"
+          --notes-file "$RUNNER_TEMP/release-notes.md"
+          --verify-tag

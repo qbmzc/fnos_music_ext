@@ -390,7 +390,7 @@ log_info "未登录降级只播免费曲目: ${FREE_ONLY_VAL}"
 log_info "PushPlus 推送: $([ "${PUSHPLUS_ENABLED_VAL}" = "true" ] && [ -n "${PUSHPLUS_TOKEN}" ] && echo "已启用 (token: ${PUSHPLUS_TOKEN:0:4}****)" || echo "未启用（不会发送任何推送）")"
 log_info "项目目录: ${BASE_DIR}"
 
-mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
+mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/media-cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
     "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
     "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
     "${BASE_DIR}/musicbox-data/netease-musicbox"
@@ -410,6 +410,8 @@ ENV_DESIRED="$(mktemp)"
 {
     echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
     echo "FNMUSIC_CACHE_DIR='$(dotenv_escape "${BASE_DIR}/cache")'"
+    echo "FNMUSIC_MEDIA_CACHE_DIR='$(dotenv_escape "${BASE_DIR}/media-cache")'"
+    echo "FNMUSIC_MEDIA_CACHE_MAX_MB='10240'"
     echo "FNMUSIC_FAV_DIR='$(dotenv_escape "${BASE_DIR}/online_favorites")'"
     echo "FNMUSIC_PLAY_HISTORY_DIR='$(dotenv_escape "${BASE_DIR}/play_history")'"
     echo "FNMUSIC_RECOMMEND_DIR='$(dotenv_escape "${BASE_DIR}/recommend_cache")'"

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import os
 import re
 import time
@@ -121,6 +122,47 @@ def _ext_for(info: dict) -> str:
 # ---------------------------------------------------------------------------
 
 _TASKS: dict[str, asyncio.Task] = {}
+_RECORDS: dict[str, dict] = {}
+_LIMITER = None
+_LIMITER_LOOP = None
+
+
+def _limiter():
+    global _LIMITER, _LIMITER_LOOP
+    loop = asyncio.get_running_loop()
+    if _LIMITER_LOOP is not loop:
+        _LIMITER, _LIMITER_LOOP = asyncio.Semaphore(2), loop
+    return _LIMITER
+
+
+def task_status() -> list[dict]:
+    return [dict(r) for r in reversed(list(_RECORDS.values()))]
+
+
+def retry(client, song_id: str, ref_writer=None) -> str:
+    record = _RECORDS.get(song_id)
+    if record is None or record['state'] != 'failed':
+        return 'not_retryable'
+    return enqueue(client, song_id, record['meta'], ref_writer)
+
+
+def _progress(song_id, written, total):
+    record = _RECORDS.get(song_id)
+    if record:
+        record.update(bytes=written, total=total)
+
+
+def _archive_paths(artist, title, ext, song_id):
+    audio, lrc = target_paths(artist, title, ext)
+    # IDs distinguish versions; reuse legacy files only with matching provenance.
+    if os.path.isfile(audio) and str(read_marker(audio).get('song_id')) == song_id:
+        return audio, lrc
+    stem, suffix = os.path.splitext(audio)
+    stem += ' [' + safe_component(song_id, 40) + ']'
+    audio, lrc = stem + suffix, stem + '.lrc'
+    if os.path.lexists(audio) and str(read_marker(audio).get('song_id')) != song_id:
+        raise ValueError('目标文件已存在且来源不符，已保护原文件')
+    return audio, lrc
 
 
 def pending_count() -> int:
@@ -204,8 +246,6 @@ def _write_marker(audio_path: str, song_id: str, quality: str, size: int) -> Non
 def read_marker(audio_path: str) -> dict:
     try:
         with open(audio_path + ".fnmusic.json", "r", encoding="utf-8") as fh:
-            import json
-
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001
@@ -237,7 +277,7 @@ async def archive_song(
     title = str(meta.get("title") or meta.get("song_name") or f"track_{song_id}")
     artist = str(meta.get("artist") or "未知歌手")
     album = str(meta.get("album") or "")
-    audio_path, lrc_path = target_paths(artist, title, ext)
+    audio_path, lrc_path = _archive_paths(artist, title, ext, str(song_id))
 
     # 已有同曲目、且品质不低于本次的归档 → 跳过（换首歌名重下会留两份垃圾文件）
     if os.path.isfile(audio_path):
@@ -259,6 +299,10 @@ async def archive_song(
                     if chunk:
                         fh.write(chunk)
                         written += len(chunk)
+                        _progress(str(song_id), written, declared)
+    except asyncio.CancelledError:
+        _discard(tmp)
+        raise
     except Exception as exc:  # noqa: BLE001
         _discard(tmp)
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:160]}
@@ -269,6 +313,9 @@ async def archive_song(
         return {"ok": False, "reason": f"incomplete_download:{written}/{declared or '?'}"}
 
     try:
+        if os.path.lexists(audio_path) and str(read_marker(audio_path).get("song_id")) != str(song_id):
+            _discard(tmp)
+            return {"ok": False, "reason": "目标文件来源不符，已保护原文件"}
         os.replace(tmp, audio_path)
     except OSError as exc:
         _discard(tmp)
@@ -303,26 +350,65 @@ def _discard(path: str) -> None:
 
 
 def enqueue(client, song_id: str, meta: dict, ref_writer: Any = None) -> str:
-    """把归档任务丢到后台，立即返回（收藏接口绝不能等下载完）。
-
-    同一首歌已有在跑的任务时直接复用，避免用户连点收藏造成重复下载。
-    """
+    song_id = str(song_id)
     prev = _TASKS.get(song_id)
     if prev is not None and not prev.done():
         return "in_progress"
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return "not_enqueued"
+    # Bound completed history; active jobs are never evicted.
+    for key in list(_RECORDS):
+        if len(_RECORDS) < 200:
+            break
+        if key not in _TASKS:
+            del _RECORDS[key]
+    if len(_TASKS) >= 200:
+        return "queue_full"
+    _RECORDS.pop(song_id, None)
+    record = dict(song_id=song_id, meta=dict(meta), state="queued", attempts=0,
+                  bytes=0, total=0, error="", updated_at=time.time())
+    _RECORDS[song_id] = record
 
     async def _run():
         try:
-            await archive_song(client, song_id, meta, ref_writer=ref_writer)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("archive task failed for %s: %s: %s", song_id, type(exc).__name__, exc)
+            for attempt in range(3):
+                async with _limiter():
+                    record.update(state="downloading", attempts=attempt + 1,
+                                  bytes=0, total=0, updated_at=time.time())
+                    try:
+                        result = await archive_song(client, song_id, meta, ref_writer=ref_writer)
+                    except Exception as exc:
+                        logger.warning("archive task failed song=%s type=%s", song_id, type(exc).__name__)
+                        result = {"ok": False, "reason": type(exc).__name__}
+                    if result.get("ok"):
+                        record.update(state="completed", error="", path=result.get("path", ""),
+                                      quality=result.get("quality", ""), updated_at=time.time())
+                        return
+                    # Never expose exception strings containing signed CDN URLs.
+                    reason = str(result.get("reason", "download_failed"))
+                    record.update(error=reason.split(":", 1)[0][:100], updated_at=time.time())
+                    logger.warning("archive failed song=%s attempt=%s reason=%s",
+                                   song_id, attempt + 1, record['error'])
+                if attempt < 2:
+                    record['state'] = 'retrying'
+                    await asyncio.sleep(2 ** (attempt + 1))
+            record['state'] = 'failed'
+        except asyncio.CancelledError:
+            record.update(state='failed', error='interrupted')
+            raise
         finally:
+            record['updated_at'] = time.time()
             _TASKS.pop(song_id, None)
 
-    try:
-        _TASKS[song_id] = asyncio.get_event_loop().create_task(_run())
-    except RuntimeError:
-        # 没有运行中的事件循环（例如同步上下文里误调）——如实记下来，不静默丢弃
-        logger.warning("archive enqueue skipped for %s: no running event loop", song_id)
-        return "not_enqueued"
+    _TASKS[song_id] = loop.create_task(_run())
     return "enqueued"
+
+
+async def shutdown():
+    tasks = list(_TASKS.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)

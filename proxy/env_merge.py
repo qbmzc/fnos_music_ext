@@ -30,6 +30,8 @@ NEW_KEYS_COMMENT = "网易云单源 + PushPlus 提醒配置（v2.0 新增，缺�
 # 因为 env_merge 由 install.sh 用系统 python3 直接调用，不能依赖 httpx。
 DEFAULT_PUSHPLUS_URL = "https://www.pushplus.plus/send"
 NEW_DEFAULTS: "list[tuple[str, str]]" = [
+    ("FNMUSIC_MEDIA_CACHE_DIR", ""),
+    ("FNMUSIC_MEDIA_CACHE_MAX_MB", "10240"),
     ("FNMUSIC_FREE_ONLY_ON_LOGOUT", "true"),
     ("FNMUSIC_DAILY_ENABLED", "true"),
     ("FNMUSIC_DAILY_LIMIT", "20"),
@@ -298,6 +300,9 @@ def ensure_prefix_defaults(
             continue
         if prefixes and not key.startswith(prefixes):
             continue
+        if key == "FNMUSIC_MEDIA_CACHE_DIR" and not val:
+            home = dict(out).get("FNMUSIC_HOME", "")
+            val = os.path.join(home or str(Path(__file__).resolve().parent.parent), "media-cache")
         out.append((key, val))
         added.append(key)
     return out, added

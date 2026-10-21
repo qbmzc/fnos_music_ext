@@ -239,6 +239,23 @@ def _as_library_dir(v: Any) -> str:
     return path
 
 
+def _as_media_cache_dir(v: Any) -> str:
+    path = str(v or "").strip()
+    if not path or not os.path.isabs(path):
+        raise ValueError("请填 NAS 上已存在的绝对路径")
+    norm = os.path.abspath(path)
+    if norm in ("/", "/etc", "/usr", "/var", "/root", "/tmp", "/proc", "/sys", "/dev"):
+        raise ValueError("不能使用系统目录")
+    if not os.path.isdir(norm) or not os.access(norm, os.W_OK):
+        raise ValueError("目录必须预先创建且可写")
+    library = os.environ.get("FNMUSIC_LIBRARY_DIR", "").strip()
+    if library and os.path.isdir(library):
+        lib = os.path.abspath(library)
+        if os.path.commonpath((norm, lib)) == lib:
+            raise ValueError("播放缓存目录必须放在音乐曲库之外")
+    return norm
+
+
 def _as_path(v: Any) -> str:
     """归档目录：必须是已存在的可写绝对路径，且不能是系统目录。
 
@@ -321,6 +338,8 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "playlist_refresh_at": ("FNMUSIC_PLAYLIST_REFRESH_AT", _as_time_of_day, False),
     # --- 收藏归档与红心同步 ---
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
+    "media_cache_dir": ("FNMUSIC_MEDIA_CACHE_DIR", _as_media_cache_dir, False),
+    "media_cache_max_mb": ("FNMUSIC_MEDIA_CACHE_MAX_MB", _int_range(256, 204800), False),
     "download_on_favorite": ("FNMUSIC_DOWNLOAD_ON_FAVORITE", _as_bool, False),
     # v2.9.28：非局域网让客户端直连网易云 CDN，音频不再经 NAS 中转
     "cdn_redirect": ("FNMUSIC_CDN_REDIRECT", _as_bool, False),
@@ -374,6 +393,8 @@ DEFAULTS = {
     "playlist_cache_ttl_h": "6",
     "playlist_refresh_at": "04:30",
     "download_dir": "",
+    "media_cache_dir": os.environ.get("FNMUSIC_MEDIA_CACHE_DIR", ""),
+    "media_cache_max_mb": "10240",
     "download_on_favorite": "true",
     "cdn_redirect": "true",
     "quality_wifi": "lossless",
@@ -536,6 +557,15 @@ def apply_config(submitted: dict[str, Any]) -> tuple[dict[str, str] | None, str]
     if errors:
         return None, "；".join(errors)
 
+    cache_dir = os.path.abspath(str(merged_display.get("media_cache_dir") or "")) if merged_display.get("media_cache_dir") else ""
+    archive_dir = os.path.abspath(str(merged_display.get("download_dir") or "")) if merged_display.get("download_dir") else ""
+    library_dir = os.path.abspath(str(merged_display.get("library_dir") or "")) if merged_display.get("library_dir") else ""
+    for other, label in ((archive_dir, "收藏归档"), (library_dir, "音乐曲库")):
+        if cache_dir and other and os.path.commonpath((cache_dir, other)) in (cache_dir, other):
+            errors.append(f"media_cache_dir: 播放缓存目录不能与{label}目录重叠")
+    if errors:
+        return None, "；".join(errors)
+
     desired_pairs = _from_display(merged_display)
     kv, _other = env_merge.parse_env_file(_env_file()) if os.path.exists(_env_file()) else ([], [])
 
@@ -649,6 +679,8 @@ app = FastAPI(title="fnmusic-ext 管理页面", lifespan=_lifespan,
 # 已知端点，按最长优先匹配。用于把「任意层数反代前缀 + 端点」归一化，
 # 这样用户经组网工具、Nginx 反代、宝塔等再套一层前缀时页面依然可用。
 KNOWN_ENDPOINTS = (
+    "/api/media-cache",
+    "/api/downloads",
     "/api/login/qr.png",
     "/api/login/qr",
     "/api/login/check",
@@ -689,6 +721,9 @@ def normalize_path(path: str) -> tuple[str, str]:
     #    把端点前面的整段当作 base。要求 path 比端点长，即前面确实有前缀。
     #    注意不要再检查前一字符是否为 "/" —— 端点自身就以 "/" 开头，
     #    前一字符是前缀的最后一个字符（如 fnmusicext 的 t）。
+    match = re.search(r"(/api/downloads/[0-9]+/retry)$", path)
+    if match:
+        return match.group(1), path[:match.start()] + "/"
     for endpoint in KNOWN_ENDPOINTS:
         if len(path) > len(endpoint) and path.endswith(endpoint):
             return endpoint, path[: len(path) - len(endpoint)] + "/"
@@ -1324,6 +1359,43 @@ async def _invalidate_proxy_cache() -> bool:
     return False
 
 
+@app.get("/api/media-cache")
+@app.delete("/api/media-cache")
+async def api_media_cache(request: Request):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    try:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+                                    base_url="http://unix", timeout=10) as client:
+            response = await client.request(request.method, "/_ext/media-cache")
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        return _err(502, f"读取播放缓存失败：{type(exc).__name__}")
+
+
+@app.get("/api/downloads")
+@app.post("/api/downloads/{song_id}/retry")
+async def api_downloads(request: Request, song_id: str = ""):
+    try:
+        _require(request)
+    except _AuthError as exc:
+        return _deny(exc.msg)
+    if song_id and not song_id.isdigit():
+        return _err(400, "无效歌曲 ID")
+    path = f"/_ext/downloads/{song_id}/retry" if song_id else "/_ext/downloads"
+    try:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=PROXY_SOCK),
+                                    base_url="http://unix", timeout=10) as client:
+            response = await client.request(request.method, path)
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        return _err(502, f"下载服务不可用：{type(exc).__name__}")
+
+
 @app.get("/api/config")
 async def api_config_get(request: Request):
     try:
@@ -1712,6 +1784,11 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
   <div class="sub">网易云单源 · 当前用户 <b>__USERNAME__</b> · <span id="ver">…</span></div>
 
   <div class="card">
+    <h2>下载任务</h2>
+    <p>最多同时下载 2 首；失败自动重试 2 次。记录保留在本次运行期间，最多 200 条。</p>
+    <div id="downloads">加载中</div>
+  </div>
+  <div class="card">
     <h2>运行状态</h2>
     <div class="row" id="status"><div class="kv"><div class="k">加载中</div><div class="v"><span class="spin"></span></div></div></div>
     <div class="acts">
@@ -1813,6 +1890,16 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <input name="playlist_refresh_at" placeholder="04:30（留空关闭）">
           <span class="ht">每天在这个时间后台刷新全部歌单曲目，第二天打开就是最新内容</span>
         </label>
+
+        <label><span class="lb">播放缓存目录</span>
+          <input name="media_cache_dir" placeholder="/vol1/@appvar/fnmusicext/media-cache">
+          <span class="ht">请先建立目录，并选择音乐曲库之外的可写目录。播放缓存不会出现在曲库扫描里，收藏归档不受清理影响。</span>
+        </label>
+        <label><span class="lb">播放缓存上限（MB）</span>
+          <input name="media_cache_max_mb" inputmode="numeric" placeholder="10240">
+          <span class="ht">默认 10 GB；超限后按最近使用时间清理。最近使用或正在写入的文件会暂时保留。</span>
+        </label>
+        <div class="acts"><button type="button" class="btn" id="cacheRefresh">查看缓存占用</button><button type="button" class="btn danger" id="cacheClear">清空播放缓存</button><span id="cacheInfo"></span></div>
 
         <label><span class="lb">收藏归档目录</span>
           <input name="download_dir" placeholder="/vol1/1000-xxx/music/网易云收藏（留空=不下载）">
@@ -2154,7 +2241,28 @@ function poll(){
       stopPolling(); qrUnikey="";
       qrState("登录成功："+(j.nickname||""),"");
       $("#qrBox").classList.add("hide"); $("#qrRefresh").classList.add("hide");
-      status(); loadCfg();
+      function downloads(){
+  api("api/downloads").then(function(j){
+    var el=$("#downloads");
+    if(!j.ok){el.textContent=j.error||"读取失败";return}
+    var names={queued:"排队中",downloading:"下载中",retrying:"等待重试",completed:"已完成",failed:"失败"};
+    el.innerHTML=(j.data||[]).map(function(t){
+      var size=t.total?Math.min(100,Math.floor(t.bytes*100/t.total))+"%":Math.round(t.bytes/1024)+" KB";
+      return '<div class="kv"><div class="k">'+esc(t.meta.artist)+' - '+esc(t.meta.title)+
+        '</div><div class="v">'+esc(names[t.state]||t.state)+' · '+esc(size)+
+        ' · 尝试 '+esc(t.attempts)+(t.error?' · '+esc(t.error):'')+
+        (t.state==='failed'?' <button class="btn" data-retry="'+esc(t.song_id)+'">重试</button>':'')+'</div></div>';
+    }).join('')||"暂无下载任务";
+  });
+}
+$("#downloads").onclick=function(e){
+  var id=e.target.getAttribute("data-retry");
+  if(id){e.target.disabled=true;api("api/downloads/"+encodeURIComponent(id)+"/retry",{method:"POST"}).then(function(j){
+    if(!j.ok) alert(j.error||j.state||"重试失败"); downloads();
+  });}
+};
+downloads(); setInterval(downloads,5000);
+status(); loadCfg();
     }
     else if(j.code===800){ stopPolling(); qrState("二维码已过期，自动换一张…"); newQr(); }
   });
@@ -2661,6 +2769,44 @@ $("#cfgForm").onsubmit=function(ev){
   });
 };
 
+function mediaCache(){
+  api("api/media-cache").then(function(j){
+    var el=$("#cacheInfo");
+    if(!j.ok){el.textContent=j.error||"缓存信息不可用";return}
+    var d=j.data||{};
+    el.textContent="缓存 "+(d.files||0)+" 首 · "+((d.bytes||0)/1073741824).toFixed(2)+" GB · 本次清理 "+(d.removed||0)+" 首";
+  });
+}
+$("#cacheRefresh").onclick=mediaCache;
+$("#cacheClear").onclick=function(){
+  if(!confirm("只清空独立的播放缓存，不会删除收藏归档。继续吗？")) return;
+  api("api/media-cache",{method:"DELETE"}).then(function(j){
+    if(!j.ok){alert(j.error||"清理失败");return}
+    $("#cacheInfo").textContent="已删除 "+((j.data||{}).removed_files||0)+" 个缓存文件";
+  });
+};
+mediaCache();
+function downloads(){
+  api("api/downloads").then(function(j){
+    var el=$("#downloads");
+    if(!j.ok){el.textContent=j.error||"读取失败";return}
+    var names={queued:"排队中",downloading:"下载中",retrying:"等待重试",completed:"已完成",failed:"失败"};
+    el.innerHTML=(j.data||[]).map(function(t){
+      var size=t.total?Math.min(100,Math.floor(t.bytes*100/t.total))+"%":Math.round(t.bytes/1024)+" KB";
+      return '<div class="kv"><div class="k">'+esc(t.meta.artist)+' - '+esc(t.meta.title)+
+        '</div><div class="v">'+esc(names[t.state]||t.state)+' · '+esc(size)+
+        ' · 尝试 '+esc(t.attempts)+(t.error?' · '+esc(t.error):'')+
+        (t.state==='failed'?' <button class="btn" data-retry="'+esc(t.song_id)+'">重试</button>':'')+'</div></div>';
+    }).join('')||"暂无下载任务";
+  });
+}
+$("#downloads").onclick=function(e){
+  var id=e.target.getAttribute("data-retry");
+  if(id){e.target.disabled=true;api("api/downloads/"+encodeURIComponent(id)+"/retry",{method:"POST"}).then(function(j){
+    if(!j.ok) alert(j.error||j.state||"重试失败"); downloads();
+  });}
+};
+downloads(); setInterval(downloads,5000);
 status(); loadCfg();
 setInterval(status, 60000);
 })();

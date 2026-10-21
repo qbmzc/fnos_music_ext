@@ -178,6 +178,8 @@ CONF = {
     "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
     "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
+    "media_cache_dir": os.environ.get("FNMUSIC_MEDIA_CACHE_DIR", os.path.join(_HOME, "media-cache")),
+    "media_cache_max_mb": _int("FNMUSIC_MEDIA_CACHE_MAX_MB", 10240),
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
@@ -953,22 +955,205 @@ def adopt_library_perms(path: str) -> None:
         pass
 
 
-def find_cache_file(guid: str) -> str | None:
+_MEDIA_CACHE_QUALITY_RANK = {"standard": 0, "higher": 1, "exhigh": 2,
+                              "lossless": 3, "hires": 4, "jymaster": 5}
+_CACHE_ACCESS_UPDATED: dict[str, float] = {}
+_ACTIVE_CACHE_WRITES: set[str] = set()
+
+
+def _managed_cache_guid_from_name(name: str) -> str:
+    match = re.fullmatch(r"(online_netease_[0-9]+)\.(?:mp3|flac|wav|ogg|opus|m4a|aac|ape|wv|dsf|dff|tta)", name, re.I)
+    if match:
+        return match.group(1).replace("_", ":")
+    return ""
+
+
+def _media_cache_meta_path(guid: str) -> str:
+    return os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.media.json")
+
+
+def _read_media_cache_meta(guid: str) -> dict:
+    try:
+        with open(_media_cache_meta_path(guid), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cached_quality(guid: str, path: str) -> str:
+    meta = _read_media_cache_meta(guid)
+    recorded = (str(meta.get("quality") or "")
+                if os.path.abspath(str(meta.get("path") or "")) == os.path.abspath(path)
+                else "")
+    # Judge the bytes on disk before trusting the requested URL tier: NetEase can
+    # return a 320k MP3 for a lossless request when that tier is unavailable.
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".flac", ".ape", ".wav", ".wv", ".dsf", ".dff", ".tta"):
+        try:
+            from mutagen import File as MutagenFile
+            audio = MutagenFile(path)
+            info = getattr(audio, "info", None)
+            if (int(getattr(info, "sample_rate", 0) or 0) >= 88_200
+                    or int(getattr(info, "bits_per_sample", 0) or 0) > 16
+                    or ext in (".dsf", ".dff")):
+                return "hires"
+        except Exception:
+            pass
+        return "lossless"
+    try:
+        from mutagen import File as MutagenFile
+        audio = MutagenFile(path)
+        bitrate = int(getattr(getattr(audio, "info", None), "bitrate", 0) or 0)
+        if bitrate >= 300_000:
+            return "exhigh"
+        if bitrate >= 180_000:
+            return "higher"
+        if bitrate > 0:
+            return "standard"
+    except Exception:
+        pass
+    # Preserve compatibility for old/unreadable formats while letting recorded
+    # URL quality serve as a conservative fallback for newly written caches.
+    return recorded or "exhigh"
+
+
+def _cache_quality_satisfies(guid: str, path: str, required: str) -> bool:
+    actual = _cached_quality(guid, path)
+    return _MEDIA_CACHE_QUALITY_RANK.get(actual, 2) >= _MEDIA_CACHE_QUALITY_RANK.get(required, 3)
+
+
+def _write_media_cache_meta(guid: str, path: str, level: str) -> None:
+    try:
+        os.makedirs(CONF["cache_dir"], exist_ok=True)
+        target = _media_cache_meta_path(guid)
+        temp = target + ".tmp"
+        with open(temp, "w", encoding="utf-8") as fh:
+            json.dump({"path": os.path.abspath(path), "quality": level,
+                       "size": os.path.getsize(path), "last_access": time.time()}, fh)
+        os.replace(temp, target)
+    except OSError as exc:
+        logger.warning("media cache index write failed for %s: %s", guid, type(exc).__name__)
+
+
+def _touch_media_cache(guid: str, path: str) -> None:
+    now = time.time()
+    if now - _CACHE_ACCESS_UPDATED.get(guid, 0) < 60:
+        return
+    meta = _read_media_cache_meta(guid)
+    if os.path.abspath(str(meta.get("path") or "")) == os.path.abspath(path):
+        meta["last_access"] = now
+        try:
+            temp = _media_cache_meta_path(guid) + ".tmp"
+            with open(temp, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh)
+            os.replace(temp, _media_cache_meta_path(guid))
+            _CACHE_ACCESS_UPDATED[guid] = now
+        except OSError:
+            pass
+
+
+def _evict_media_cache(protect: str = "") -> dict:
+    try:
+        root = media_cache_root()
+    except (OSError, ValueError) as exc:
+        logger.error("拒绝清理无效播放缓存目录: %s", type(exc).__name__)
+        return {"files": 0, "bytes": 0, "removed": 0, "error": "invalid_cache_dir"}
+    if not os.path.isdir(root):
+        return {"files": 0, "bytes": 0, "removed": 0}
+    entries = []
+    total = 0
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        guid = _managed_cache_guid_from_name(name)
+        if not guid or not os.path.isfile(path):
+            continue
+        size = os.path.getsize(path)
+        meta = _read_media_cache_meta(guid)
+        access = float(meta.get("last_access") or os.path.getmtime(path))
+        total += size
+        entries.append((access, path, size, guid))
+    limit = max(0, int(CONF.get("media_cache_max_mb", 10240))) * 1024 * 1024
+    removed = 0
+    # Keep recently accessed files for 15 minutes to avoid unlinking a file
+    # a player may currently be reading. Temporary downloads are never counted.
+    for access, path, size, guid in sorted(entries):
+        if total <= limit:
+            break
+        if os.path.abspath(path) == os.path.abspath(protect) or path in _ACTIVE_CACHE_WRITES:
+            continue
+        if time.time() - access < 900:
+            continue
+        try:
+            os.remove(path)
+            for sibling in (os.path.splitext(path)[0] + ".lrc", _media_cache_meta_path(guid), media_ref_path(guid)):
+                try:
+                    os.remove(sibling)
+                except OSError:
+                    pass
+            total -= size
+            removed += 1
+        except OSError as exc:
+            logger.warning("media cache eviction failed: %s (%s)", os.path.basename(path), type(exc).__name__)
+    return {"files": len(entries) - removed, "bytes": total, "removed": removed}
+
+
+def _media_cache_stats() -> dict:
+    try:
+        root = media_cache_root()
+    except (OSError, ValueError):
+        return {"files": 0, "bytes": 0, "error": "invalid_cache_dir"}
+    if not os.path.isdir(root):
+        return {"files": 0, "bytes": 0, "limit_mb": int(CONF.get("media_cache_max_mb", 10240))}
+    files = [os.path.join(root, n) for n in os.listdir(root)
+             if _managed_cache_guid_from_name(n)
+             and os.path.isfile(os.path.join(root, n))]
+    return {"files": len(files), "bytes": sum(os.path.getsize(p) for p in files),
+            "limit_mb": int(CONF.get("media_cache_max_mb", 10240))}
+
+
+def _required_cache_level(request: Request) -> str:
+    return str(quality.resolve(request).get("level") or "lossless")
+
+
+def media_cache_root() -> str:
+    configured = str(CONF.get("media_cache_dir") or "").strip()
+    if not configured or not os.path.isabs(configured):
+        raise ValueError("播放缓存目录必须是绝对路径")
+    root = os.path.realpath(configured)
+    if root == "/":
+        raise ValueError("播放缓存目录无效")
+    library = os.path.realpath(detect_library_dir())
+    common = os.path.commonpath((root, library))
+    if common in (root, library):
+        raise ValueError("播放缓存目录必须与音乐曲库分开")
+    archive_raw = str(os.environ.get("FNMUSIC_DOWNLOAD_DIR") or "").strip()
+    if archive_raw:
+        archive = os.path.realpath(archive_raw)
+        if archive != "/" and os.path.commonpath((root, archive)) in (root, archive):
+            raise ValueError("播放缓存目录不能与收藏归档目录重叠")
+    return root
+
+
+def find_cache_file(guid: str, required_quality: str = "") -> str | None:
     recalled = recalled_media_path(guid)
-    if recalled:
+    if recalled and (not required_quality or _cache_quality_satisfies(guid, recalled, required_quality)):
+        _touch_media_cache(guid, recalled)
         return recalled
     file_id = online_file_id(guid)
     safe = cache_safe_guid(guid)
-    for d in iter_media_dirs():
+    for d in (CONF.get("media_cache_dir", ""), *iter_media_dirs()):
         if not os.path.isdir(d):
             continue
         for ext in CACHE_EXTS:
             exact = os.path.join(d, f"{safe}.{ext}")
-            if os.path.exists(exact) and os.path.getsize(exact) > 0:
+            if os.path.exists(exact) and os.path.getsize(exact) > 0 and (not required_quality or _cache_quality_satisfies(guid, exact, required_quality)):
+                _touch_media_cache(guid, exact)
                 return exact
             pattern = os.path.join(d, f"* - {glob.escape(file_id)}.{ext}")
             for path in glob.glob(pattern):
-                if os.path.getsize(path) > 0:
+                if os.path.getsize(path) > 0 and (not required_quality or _cache_quality_satisfies(guid, path, required_quality)):
+                    _touch_media_cache(guid, path)
                     return path
     return None
 
@@ -978,6 +1163,13 @@ def promote_cache_hit(guid: str, audio_path: str) -> str:
     recalled = recalled_media_path(guid)
     if recalled:
         return recalled
+    # 新版播放缓存始终留在独立目录，不能因曲库里存在同名歌词而被提升进曲库。
+    try:
+        cache_root = media_cache_root()
+        if os.path.commonpath((cache_root, os.path.realpath(audio_path))) == cache_root:
+            return audio_path
+    except (OSError, ValueError):
+        pass
     lib = detect_library_dir()
     try:
         if os.path.abspath(os.path.dirname(audio_path)) == os.path.abspath(lib):
@@ -1008,19 +1200,13 @@ def promote_cache_hit(guid: str, audio_path: str) -> str:
 
 def library_media_path(guid: str, title: str, ext: str, artist: str = "") -> str:
     recalled = recalled_media_path(guid)
-    if recalled:
+    root = media_cache_root()
+    if (recalled and root
+            and os.path.commonpath((root, os.path.abspath(recalled))) == root
+            and os.path.splitext(recalled)[1].lstrip(".").lower() == ext.lstrip(".").lower()):
         return recalled
-    stem = recalled_media_stem(guid)
-    if stem:
-        return f"{stem}.{ext}"
-    lib = detect_library_dir()
-    file_id = online_file_id(guid)
-    if os.path.isdir(lib):
-        for path in glob.glob(os.path.join(lib, f"* - {glob.escape(file_id)}.{ext}")):
-            if os.path.getsize(path) > 0:
-                return path
-    os.makedirs(lib, exist_ok=True)
-    return unique_library_path(lib, library_basename(title, artist), ext)
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, f"{cache_safe_guid(guid)}.{ext.lstrip('.') or 'mp3'}")
 
 
 def find_lyric_file(guid: str) -> str | None:
@@ -1036,7 +1222,7 @@ def find_lyric_file(guid: str) -> str | None:
             return sibling
     file_id = online_file_id(guid)
     safe = cache_safe_guid(guid)
-    for d in iter_media_dirs():
+    for d in (CONF.get("media_cache_dir", ""), *iter_media_dirs()):
         if not os.path.isdir(d):
             continue
         exact = os.path.join(d, f"{safe}.lrc")
@@ -1051,16 +1237,14 @@ def find_lyric_file(guid: str) -> str | None:
 
 def lyric_cache_path(guid: str, title: str = "", artist: str = "") -> str:
     found = find_lyric_file(guid)
-    if found:
+    root = media_cache_root()
+    if found and os.path.commonpath((root, os.path.realpath(found))) == root:
         return found
     audio = find_cache_file(guid)
     if audio:
         return os.path.splitext(audio)[0] + ".lrc"
-    d = detect_library_dir()
-    os.makedirs(d, exist_ok=True)
-    if (title or "").strip() or (artist or "").strip():
-        return os.path.join(d, f"{library_basename(title, artist)}.lrc")
-    return os.path.join(d, f"{cache_safe_guid(guid)}.lrc")
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, f"{cache_safe_guid(guid)}.lrc")
 
 
 def read_lyric_cache(guid: str) -> str:
@@ -1648,6 +1832,7 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
         if cached:
             if stats is not None:
                 stats["url_cache_hit"] = True
+                stats["resolved_quality"] = q
             return cached
 
     for q in qualities:
@@ -1662,6 +1847,8 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
                         url = inner.get("url")
                         if code == 200 and url:
                             _url_cache_put(song_id, q, str(url))
+                            if stats is not None:
+                                stats["resolved_quality"] = q
                             return str(url)
         except Exception as e:
             logger.warning("resolve_netease_url error for %s (quality=%s): %s: %s",
@@ -2102,6 +2289,7 @@ async def lifespan(fastapi_app: FastAPI):
         yield
     finally:
         stop_event.set()
+        await downloader.shutdown()
         if refresh_task is not None:
             refresh_task.cancel()
         netease_auth.stop_watch()
@@ -2348,6 +2536,60 @@ async def ext_local_first():
     except Exception as exc:  # noqa: BLE001
         logger.warning("local first diag failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/media-cache")
+async def ext_media_cache():
+    return {"ok": True, "data": _media_cache_stats()}
+
+
+@app.delete("/_ext/media-cache")
+async def ext_media_cache_clear():
+    try:
+        root = media_cache_root()
+    except (OSError, ValueError):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_cache_dir"})
+    removed = 0
+    for name in os.listdir(root) if os.path.isdir(root) else []:
+        path = os.path.join(root, name)
+        audio_guid = _managed_cache_guid_from_name(name)
+        is_part = bool(re.fullmatch(r"online_netease_[0-9]+\.[0-9a-f]{8}\.part", name, re.I))
+        is_lyric = bool(re.fullmatch(r"online_netease_[0-9]+\.lrc", name, re.I))
+        if not (audio_guid or is_part or is_lyric) or path in _ACTIVE_CACHE_WRITES:
+            continue
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    # Only forget refs whose target was inside this dedicated cache directory.
+    for name in os.listdir(CONF["cache_dir"]) if os.path.isdir(CONF["cache_dir"]) else []:
+        if not re.fullmatch(r"online_netease_[0-9]+\.ref", name):
+            continue
+        ref = os.path.join(CONF["cache_dir"], name)
+        try:
+            with open(ref, encoding="utf-8") as fh:
+                stem = os.path.abspath(fh.read().strip())
+            if os.path.commonpath((root, stem)) == root:
+                os.remove(ref)
+        except (OSError, ValueError):
+            pass
+    return {"ok": True, "data": {"removed_files": removed}}
+
+
+@app.get("/_ext/downloads")
+async def ext_downloads():
+    return {"ok": True, "data": downloader.task_status()}
+
+
+@app.post("/_ext/downloads/{song_id}/retry")
+async def ext_download_retry(song_id: str, request: Request):
+    if not song_id.isdigit():
+        return {"ok": False, "error": "invalid_song_id"}
+    state = downloader.retry(get_musicbox_client(request.app), song_id,
+        ref_writer=lambda path: remember_archive_path(f"online:netease:{song_id}", path))
+    return {"ok": state == "enqueued", "state": state}
 
 
 @app.get("/_ext/prefetch")
@@ -2785,6 +3027,8 @@ def stream_tee_response(
     client_to_close: httpx.AsyncClient | None = None,
     resolved_ext: str | None = None,
     pre_info: dict | None = None,
+    resolved_quality: str = "",
+    requested_quality: str = "",
 ) -> Response:
     out_headers = {"Accept-Ranges": "bytes"}
     for k in ("content-type", "content-length", "content-range"):
@@ -2813,10 +3057,14 @@ def stream_tee_response(
     )
 
     ext = (resolved_ext or "").strip().lower() or ext_from_content_type(resp.headers.get("content-type") or "")
-    store_dir = detect_library_dir()
-
-    if should_cache(range_header):
+    try:
+        store_dir = media_cache_root()
         os.makedirs(store_dir, exist_ok=True)
+    except (OSError, ValueError) as exc:
+        logger.error("播放缓存不可用，继续在线播放但不落盘: %s", type(exc).__name__)
+        store_dir = ""
+
+    if should_cache(range_header) and store_dir:
         part_path = os.path.join(store_dir, f"{cache_safe_guid(guid)}.{uuid4().hex[:8]}.part")
         info_task: asyncio.Task | None = None
         if pre_info is None and coro_factory is not None:
@@ -2856,6 +3104,7 @@ def stream_tee_response(
             part_file = None
             abandoned = False
             try:
+                _ACTIVE_CACHE_WRITES.add(part_path)
                 part_file = open(part_path, "wb")
                 async for chunk in resp.aiter_bytes():
                     if not chunk:
@@ -2870,6 +3119,7 @@ def stream_tee_response(
             except Exception as e:
                 logger.warning("tee download failed for %s: %s", guid, e)
             finally:
+                _ACTIVE_CACHE_WRITES.discard(part_path)
                 if part_file:
                     try:
                         part_file.close()
@@ -2903,14 +3153,24 @@ def stream_tee_response(
                                     "不纠正会落出「.flac 装 MP3」的坏文件",
                                     ext, _sniffed, guid)
                         ext = _sniffed
+                    old_media = recalled_media_path(guid)
                     dest = library_media_path(guid, title, ext, artist=artist)
                     try:
                         os.replace(part_path, dest)
                         adopt_library_perms(dest)
                         remember_media_path(guid, dest)
+                        _write_media_cache_meta(guid, dest, resolved_quality or requested_quality)
                         write_audio_tags(dest, title=title, artist=artist, album=album)
                         if lyric_text.strip():
                             write_lyric_cache(guid, lyric_text, title=title, artist=artist)
+                        if old_media and os.path.abspath(old_media) != os.path.abspath(dest):
+                            cache_root = media_cache_root()
+                            if os.path.commonpath((cache_root, os.path.realpath(old_media))) == cache_root:
+                                try:
+                                    os.remove(old_media)
+                                except OSError:
+                                    pass
+                        _evict_media_cache(protect=dest)
                     except Exception as e:
                         logger.warning("Failed to rename cache file: %s", e)
                         if os.path.exists(part_path):
@@ -3233,7 +3493,9 @@ async def stream_track(request: Request):
         return True
 
     range_header = request.headers.get("range")
-    cached = find_cache_file(guid)
+    desired_cache_quality = _required_cache_level(request)
+    cached = find_cache_file(guid, desired_cache_quality)
+    lower_quality_cache = None if cached else find_cache_file(guid)
     if cached:
         cached = promote_cache_hit(guid, cached)
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
@@ -3390,6 +3652,12 @@ async def stream_track(request: Request):
                 return _serve_local_fallback("netease resolve failed")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("local fallback serve failed for %s: %s", guid, exc)
+        if lower_quality_cache:
+            logger.info("requested quality unavailable for %s; falling back to existing lower-quality cache",
+                        guid)
+            ext = os.path.splitext(lower_quality_cache)[1].lstrip(".") or "mp3"
+            _log_play("tee-cache-fallback", " local")
+            return serve_file_with_range(lower_quality_cache, range_header, media_type_for_ext(ext))
         state = netease_auth.current_state()
         if not state.logged_in:
             logger.info("stream 404 for %s: 网易云未登录，该曲目需要账号权益", guid)
@@ -3471,6 +3739,11 @@ async def stream_track(request: Request):
                 return _serve_local_fallback("cdn unreachable")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("local fallback serve failed for %s: %s", guid, exc)
+        if resp is None and lower_quality_cache:
+            logger.info("CDN unavailable for %s; falling back to existing lower-quality cache", guid)
+            ext = os.path.splitext(lower_quality_cache)[1].lstrip(".") or "mp3"
+            _log_play("tee-cache-fallback", " local")
+            return serve_file_with_range(lower_quality_cache, range_header, media_type_for_ext(ext))
         if resp is None:
             _note_stream_fail(guid, "直链取流失败（已重取一次仍不可用）",
                               (time.monotonic() - started) * 1000.0, "open-cdn")
@@ -3487,6 +3760,8 @@ async def stream_track(request: Request):
         client_to_close=None,
         resolved_ext=resolved_ext,
         pre_info=info if isinstance(info, dict) else None,
+        resolved_quality=str(_gather_flags.get("resolved_quality") or desired_cache_quality),
+        requested_quality=desired_cache_quality,
     )
 
 

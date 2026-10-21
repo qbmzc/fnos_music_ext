@@ -1367,3 +1367,17 @@ def test_library_dir_roundtrip(env, tmp_path):
         r = post_cfg(c, {"library_dir": ""})
         assert r.json()["ok"] is True, r.text
     assert read_env(env)["FNMUSIC_LIBRARY_DIR"] == ""
+
+
+@pytest.mark.parametrize("path", ["/api/downloads", "/api/downloads/123/retry"])
+def test_download_tasks_require_admin(path):
+    with TestClient(admin_ui.app) as c:
+        r = c.post(path, headers=USER) if path.endswith('retry') else c.get(path, headers=USER)
+        assert r.status_code == 403
+
+
+@pytest.mark.parametrize("path", ["/nested/app/fnmusicext/api/downloads", "/nested/app/fnmusicext/api/downloads/123/retry"])
+def test_download_tasks_nested_prefix(path):
+    normalized, base = admin_ui.normalize_path(path)
+    assert normalized == path[len('/nested/app/fnmusicext'):]
+    assert base == '/nested/app/fnmusicext/'

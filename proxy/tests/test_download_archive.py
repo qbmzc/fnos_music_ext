@@ -160,8 +160,8 @@ async def test_archive_happy_path(archive_dir):
     assert res["ok"] is True, res
     assert res["quality"] == "lossless"
 
-    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天.flac"
-    lrc = archive_dir / "周杰伦" / "周杰伦 - 晴天.lrc"
+    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天 [100].flac"
+    lrc = archive_dir / "周杰伦" / "周杰伦 - 晴天 [100].lrc"
     assert audio.exists() and audio.stat().st_size == 2048
     assert "[00:01.00]第一句" in lrc.read_text(encoding="utf-8")
 
@@ -178,10 +178,10 @@ async def test_archive_without_lyric_still_writes_audio(archive_dir):
                           "/api/v1/song/100/lyric": {"ok": True, "data": {"lyric": ""}}})
     res = await dl.archive_song(client, "100", META)
     assert res["ok"] is True
-    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天.flac"
+    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天 [100].flac"
     assert audio.exists()
     assert res["lrc"] is False
-    assert not (archive_dir / "周杰伦" / "周杰伦 - 晴天.lrc").exists(), "空歌词不该留个空文件"
+    assert not (archive_dir / "周杰伦" / "周杰伦 - 晴天 [100].lrc").exists(), "空歌词不该留个空文件"
 
 
 @pytest.mark.anyio
@@ -237,7 +237,7 @@ async def test_already_archived_same_quality_is_skipped(archive_dir):
     client = _FakeClient({"/api/v1/song/100/best_url": BEST, "/api/v1/song/100/lyric": LYRIC})
     first = await dl.archive_song(client, "100", META)
     assert first["ok"] is True
-    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天.flac"
+    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天 [100].flac"
     mtime = audio.stat().st_mtime
 
     again = await dl.archive_song(client, "100", META)
@@ -249,7 +249,7 @@ async def test_already_archived_same_quality_is_skipped(archive_dir):
 async def test_higher_quality_replaces_existing(archive_dir):
     client = _FakeClient({"/api/v1/song/100/best_url": BEST, "/api/v1/song/100/lyric": LYRIC})
     await dl.archive_song(client, "100", META)
-    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天.flac"
+    audio = archive_dir / "周杰伦" / "周杰伦 - 晴天 [100].flac"
 
     better = {"ok": True, "data": {"url": "http://cdn/a2.flac", "code": 200,
                                    "best_quality": "jymaster", "level": "jymaster", "type": "flac"}}
@@ -291,3 +291,76 @@ async def test_enqueue_dedupes_in_progress(monkeypatch, archive_dir):
     assert dl.pending_count() == 0, "任务结束后必须自己出队，否则字典只增不减"
     assert sorted(started) == ["7", "8"]
     await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_same_title_different_ids_and_user_file_are_preserved(archive_dir):
+    folder = archive_dir / "周杰伦"
+    folder.mkdir()
+    original = folder / "周杰伦 - 晴天.flac"
+    original.write_bytes(b"user music")
+    for sid in ("100", "101"):
+        client = _FakeClient({f"/api/v1/song/{sid}/best_url": BEST})
+        result = await dl.archive_song(client, sid, META)
+        assert result["ok"]
+        assert dl.read_marker(result["path"])["song_id"] == sid
+    assert original.read_bytes() == b"user music"
+    assert len(list(folder.glob("*.flac"))) == 3
+
+
+@pytest.mark.anyio
+async def test_legacy_matching_marker_is_reused(archive_dir):
+    audio, _ = dl.target_paths(META['artist'], META['title'], 'flac')
+    Path(audio).parent.mkdir()
+    Path(audio).write_bytes(b'x' * 2048)
+    dl._write_marker(audio, '100', 'lossless', 2048)
+    result = await dl.archive_song(_FakeClient({'/api/v1/song/100/best_url': BEST}), '100', META)
+    assert result['skipped'] == 'already_archived'
+    assert result['path'] == audio
+
+
+@pytest.mark.anyio
+async def test_queue_caps_concurrency_and_retains_results(monkeypatch, archive_dir):
+    import asyncio
+    gate = asyncio.Event()
+    active = set()
+    peak = 0
+    async def archive(client, sid, meta, ref_writer=None):
+        nonlocal peak
+        active.add(sid)
+        peak = max(peak, len(active))
+        await gate.wait()
+        active.remove(sid)
+        return {'ok': True}
+    monkeypatch.setattr(dl, 'archive_song', archive)
+    for sid in ('201', '202', '203'):
+        dl.enqueue(None, sid, META)
+    await asyncio.sleep(0)
+    assert peak == 2
+    assert dl._RECORDS['203']['state'] == 'queued'
+    gate.set()
+    await asyncio.gather(*list(dl._TASKS.values()))
+    assert all(dl._RECORDS[s]['state'] == 'completed' for s in ('201','202','203'))
+
+
+@pytest.mark.anyio
+async def test_failure_retries_and_manual_retry(monkeypatch, archive_dir):
+    import asyncio
+    real_sleep = asyncio.sleep
+    async def immediate(delay):
+        await real_sleep(0)
+    async def fail(client, sid, meta, ref_writer=None):
+        return {'ok': False, 'reason': 'upstream_http_503'}
+    monkeypatch.setattr(dl.asyncio, 'sleep', immediate)
+    monkeypatch.setattr(dl, 'archive_song', fail)
+    dl.enqueue(None, '301', META)
+    await dl._TASKS['301']
+    assert dl._RECORDS['301']['state'] == 'failed'
+    assert dl._RECORDS['301']['attempts'] == 3
+    async def success(client, sid, meta, ref_writer=None):
+        return {'ok': True}
+    monkeypatch.setattr(dl, 'archive_song', success)
+    assert dl.retry(None, '301') == 'enqueued'
+    await dl._TASKS['301']
+    assert dl._RECORDS['301']['state'] == 'completed'
+    assert dl.retry(None, 'missing') == 'not_retryable'

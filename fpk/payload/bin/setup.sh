@@ -112,7 +112,7 @@ stage_code() {
         fi
     done
     # 数据目录（首次创建，之后一律保留）
-    mkdir -p "${RUN_DIR}/cache" "${RUN_DIR}/online_favorites" \
+    mkdir -p "${RUN_DIR}/cache" "${RUN_DIR}/media-cache" "${RUN_DIR}/online_favorites" \
              "${RUN_DIR}/play_history" "${RUN_DIR}/recommend_cache" || true
     chmod +x "${RUN_DIR}/restore.sh" "${RUN_DIR}/netease_login.sh" \
              "${RUN_DIR}/proxy/run_proxy.sh" "${RUN_DIR}"/bin/*.sh 2>/dev/null || true
@@ -226,6 +226,8 @@ write_env_file() {
         echo "FNMUSIC_PUSHPLUS_URL=$(dq "$(pick_env FNMUSIC_PUSHPLUS_URL "" https://www.pushplus.plus/send)")"
         echo "# --- 运行时路径 ---"
         echo "FNMUSIC_CACHE_DIR=$(dq "${RUN_DIR}/cache")"
+        echo "FNMUSIC_MEDIA_CACHE_DIR=$(dq "$(pick_env FNMUSIC_MEDIA_CACHE_DIR "" "${RUN_DIR}/media-cache")")"
+        echo "FNMUSIC_MEDIA_CACHE_MAX_MB=$(dq "$(pick_env FNMUSIC_MEDIA_CACHE_MAX_MB "" 10240)")"
         echo "FNMUSIC_FAV_DIR=$(dq "${RUN_DIR}/online_favorites")"
         echo "FNMUSIC_PLAY_HISTORY_DIR=$(dq "${RUN_DIR}/play_history")"
         echo "FNMUSIC_RECOMMEND_DIR=$(dq "${RUN_DIR}/recommend_cache")"
@@ -267,7 +269,7 @@ write_env_file() {
                     FNMUSIC_QUALITY_DB_RESCAN|FNMUSIC_REMOTE_AS_CELLULAR|FNMUSIC_LOCAL_FIRST|\
                     FNMUSIC_LOCAL_INDEX_TTL|FNMUSIC_COVER_RESIZE_PX|FNMUSIC_PUSHPLUS_ENABLED|FNMUSIC_PUSHPLUS_TOKEN|\
                     FNMUSIC_PUSHPLUS_TOPIC|FNMUSIC_PUSHPLUS_TEMPLATE|FNMUSIC_PUSHPLUS_URL|\
-                    FNMUSIC_CACHE_DIR|FNMUSIC_FAV_DIR|FNMUSIC_PLAY_HISTORY_DIR|FNMUSIC_RECOMMEND_DIR|\
+                    FNMUSIC_CACHE_DIR|FNMUSIC_MEDIA_CACHE_DIR|FNMUSIC_MEDIA_CACHE_MAX_MB|FNMUSIC_FAV_DIR|FNMUSIC_PLAY_HISTORY_DIR|FNMUSIC_RECOMMEND_DIR|\
                     FNMUSIC_UPSTREAM_SOCK|FNMUSIC_LIBRARY_DIR|FNMUSIC_MUSIC_DB|FNMUSIC_PIP_INDEX|\
                     FNMUSIC_LOG_MAX_MB|FNMUSIC_LOG_MAX_DAYS|FNMUSIC_LOG_SCAN_INTERVAL|\
                     FNMUSIC_LOG_QUIET|FNMUSIC_CDN_REDIRECT|FNMUSIC_PLAY_RESOLVE_TIMEOUT_S)
