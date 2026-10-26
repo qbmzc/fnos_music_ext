@@ -1023,14 +1023,22 @@ def _cache_quality_satisfies(guid: str, path: str, required: str) -> bool:
     return _MEDIA_CACHE_QUALITY_RANK.get(actual, 2) >= _MEDIA_CACHE_QUALITY_RANK.get(required, 3)
 
 
-def _write_media_cache_meta(guid: str, path: str, level: str) -> None:
+def _write_media_cache_meta(guid: str, path: str, level: str,
+                            info: dict | None = None) -> None:
     try:
         os.makedirs(CONF["cache_dir"], exist_ok=True)
         target = _media_cache_meta_path(guid)
         temp = target + ".tmp"
+        payload = {"path": os.path.abspath(path), "quality": level,
+                   "size": os.path.getsize(path), "last_access": time.time()}
+        if isinstance(info, dict):
+            # 元数据接口偶尔不可用时，播放历史/收藏还能从这份本地索引恢复标题与时长
+            for key in ("title", "artist", "album", "duration_s"):
+                value = info.get(key)
+                if value not in (None, "", 0):
+                    payload[key] = value
         with open(temp, "w", encoding="utf-8") as fh:
-            json.dump({"path": os.path.abspath(path), "quality": level,
-                       "size": os.path.getsize(path), "last_access": time.time()}, fh)
+            json.dump(payload, fh)
         os.replace(temp, target)
     except OSError as exc:
         logger.warning("media cache index write failed for %s: %s", guid, type(exc).__name__)
@@ -3159,7 +3167,8 @@ def stream_tee_response(
                         os.replace(part_path, dest)
                         adopt_library_perms(dest)
                         remember_media_path(guid, dest)
-                        _write_media_cache_meta(guid, dest, resolved_quality or requested_quality)
+                        _write_media_cache_meta(guid, dest, resolved_quality or requested_quality,
+                                                info)
                         write_audio_tags(dest, title=title, artist=artist, album=album)
                         if lyric_text.strip():
                             write_lyric_cache(guid, lyric_text, title=title, artist=artist)
@@ -4974,6 +4983,170 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
     }
 
 
+# ---------------------------------------------------------------------------
+# 播放历史里的在线曲目快照
+#
+# 在线播放事件由本插件自己记（上游不认识 online: guid）。v2.9.32 起播放缓存
+# 文件名固定为 online_netease_<songid>，而老逻辑在取不到元数据时拿缓存文件
+# 名当标题——「最近播放」于是出现 online_netease_12961… 且时长为 0。这里统一
+# 用真实元数据/缓存内嵌标签生成快照，绝不把内部文件名当歌名。
+# ---------------------------------------------------------------------------
+
+_INTERNAL_CACHE_STEM = re.compile(r"^online_netease_[0-9]+(?:\.[0-9a-z]+)?$", re.I)
+_HISTORY_INFO_TIMEOUT_S = 3.0
+_HISTORY_INFO_MISS_TTL = 600.0
+_HISTORY_REPAIR_MAX = 8
+_HISTORY_INFO_MISS: dict[str, float] = {}
+_CACHE_TAG_INFO: "dict[str, tuple[tuple[float, int], dict]]" = {}
+
+
+def _looks_like_internal_name(name: str) -> bool:
+    return bool(_INTERNAL_CACHE_STEM.fullmatch(str(name or "").strip()))
+
+
+def _cached_audio_meta(path: str) -> dict:
+    """读缓存音频的内嵌标签与时长，纯本地 IO；按 mtime/size 记忆避免重复解析。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    stamp = (st.st_mtime, st.st_size)
+    key = os.path.abspath(path)
+    hit = _CACHE_TAG_INFO.get(key)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    meta: dict[str, Any] = {}
+    try:
+        from mutagen import File as MutagenFile
+
+        audio = MutagenFile(path, easy=True)
+        if audio is not None:
+            def _first(field: str) -> str:
+                values = audio.get(field) or []
+                return str(values[0]).strip() if values else ""
+
+            meta = {
+                "title": _first("title"),
+                "artist": _first("artist"),
+                "album": _first("album"),
+                "duration_s": float(getattr(getattr(audio, "info", None), "length", 0) or 0),
+            }
+    except Exception:
+        meta = {}
+    if len(_CACHE_TAG_INFO) >= 512:
+        _CACHE_TAG_INFO.clear()
+    _CACHE_TAG_INFO[key] = (stamp, meta)
+    return meta
+
+
+def _title_artist_from_cache_name(path: str) -> tuple[str, str]:
+    """旧版缓存按「歌手 - 歌名」命名，可作为元数据缺失时的兜底；内部文件名不算。"""
+    base = os.path.splitext(os.path.basename(path))[0].strip()
+    if not base or _looks_like_internal_name(base):
+        return "", ""
+    if " - " in base:
+        artist, title = base.split(" - ", 1)
+        artist, title = artist.strip(), title.strip()
+        if artist and title:
+            return title, artist
+    return base, ""
+
+
+def _known_cache_path(guid: str, meta: dict | None = None) -> str:
+    """快速定位某个 guid 的缓存文件（不做全目录 glob，历史修复可能一次查很多条）。"""
+    recalled = recalled_media_path(guid)
+    if recalled:
+        return recalled
+    if meta is None:
+        meta = _read_media_cache_meta(guid)
+    recorded = str(meta.get("path") or "")
+    if recorded and os.path.isfile(recorded) and os.path.getsize(recorded) > 0:
+        return recorded
+    safe = cache_safe_guid(guid)
+    for d in (CONF.get("media_cache_dir", ""), *iter_media_dirs()):
+        if not os.path.isdir(d):
+            continue
+        for ext in CACHE_EXTS:
+            path = os.path.join(d, f"{safe}.{ext}")
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+    return ""
+
+
+def _history_track_with_cache(guid: str, track: dict | None = None,
+                              info: dict | None = None) -> dict:
+    """补齐历史曲目快照：真实元数据优先，其次媒体缓存元数据 / 音频内嵌标签。"""
+    data = dict(track or {})
+    if isinstance(info, dict):
+        for key in ("title", "artist", "album", "cover_url", "duration_s",
+                    "ext", "file_size", "lyric"):
+            value = info.get(key)
+            if value not in (None, "", 0):
+                data[key] = value
+
+    title = str(data.get("title") or "").strip()
+    artist = str(data.get("artist") or "").strip()
+    album = str(data.get("album") or "").strip()
+    try:
+        duration_s = float(data.get("duration_s") or 0)
+    except (TypeError, ValueError):
+        duration_s = 0.0
+
+    if not title or _looks_like_internal_name(title):
+        meta = _read_media_cache_meta(guid)
+        cached = _known_cache_path(guid, meta)
+        tags = _cached_audio_meta(cached) if cached else {}
+
+        title = ""
+        for candidate in (meta.get("title"), tags.get("title")):
+            candidate = str(candidate or "").strip()
+            if candidate and not _looks_like_internal_name(candidate):
+                title = candidate
+                break
+        if not title and cached:
+            title, name_artist = _title_artist_from_cache_name(cached)
+            artist = artist or name_artist
+        if not artist:
+            artist = str(meta.get("artist") or tags.get("artist") or "").strip()
+        if not album:
+            album = str(meta.get("album") or tags.get("album") or "").strip()
+        if not duration_s:
+            for candidate in (meta.get("duration_s"), tags.get("duration_s")):
+                try:
+                    duration_s = float(candidate or 0)
+                except (TypeError, ValueError):
+                    duration_s = 0.0
+                if duration_s:
+                    break
+
+    data["title"] = title
+    data["artist"] = artist
+    data["album"] = album
+    data["duration_s"] = duration_s
+    data.setdefault("id", song_id_from_online_guid(guid))
+    data.setdefault("source", source_from_online_guid(guid))
+    return data
+
+
+def _history_title_missing(track: dict | None) -> bool:
+    title = str((track or {}).get("title") or "").strip()
+    return not title or _looks_like_internal_name(title)
+
+
+async def _history_track_snapshot(request: Request, guid: str) -> dict:
+    """播放事件落库前的曲目快照；元数据失败也必须能落库，只是回退本地缓存。"""
+    info = _peek_online_info(guid)
+    if not info:
+        try:
+            info = await asyncio.wait_for(
+                _online_info(request, guid), timeout=_HISTORY_INFO_TIMEOUT_S)
+        except (asyncio.TimeoutError, TimeoutError):
+            info = None
+        except Exception:  # noqa: BLE001 - 元数据失败不能影响播放事件上报
+            info = None
+    return _history_track_with_cache(guid, info=info)
+
+
 async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> tuple[bool, str, Response | None]:
     """向上游探测用户是否已登录。复用当前请求 headers。
     返回 (is_authed, user_guid, error_response)。
@@ -5041,24 +5214,9 @@ async def favorite_track_create(request: Request):
 
     now = int(time.time())
     info = await _online_info(request, guid)
-    if not info:
-        cached_lyric = read_lyric_cache(guid)
-        title = ""
-        artist = ""
-        cached_media = find_cache_file(guid)
-        if cached_media:
-            base = os.path.splitext(os.path.basename(cached_media))[0]
-            if " - " in base:
-                artist, title = base.split(" - ", 1)
-            else:
-                title = base
-        info = {
-            "id": song_id_from_online_guid(guid),
-            "source": source_from_online_guid(guid),
-            "title": title,
-            "artist": artist,
-            "lyric": cached_lyric,
-        }
+    info = _history_track_with_cache(guid, info=info)
+    if not str(info.get("lyric") or ""):
+        info["lyric"] = read_lyric_cache(guid)
 
     track_obj = build_favorite_track_obj(guid, info, created_at=now)
 
@@ -6077,23 +6235,17 @@ async def event_report(request: Request):
     if online_plays:
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if is_authed:
+            # 快照必须在锁外取（里面可能等 musicbox）；落库仍串行，避免并发写花历史文件。
+            snapshots = await asyncio.gather(
+                *(_history_track_snapshot(request, guid) for guid in online_plays),
+                return_exceptions=True,
+            )
             async with _HISTORY_LOCK:
-                for guid in online_plays:
-                    info = stub_online_info(guid)
-                    cached = find_cache_file(guid)
-                    title = str(info.get("title") or "")
-                    artist = str(info.get("artist") or "")
-                    if cached:
-                        base = os.path.splitext(os.path.basename(cached))[0]
-                        if " - " in base:
-                            artist, title = base.split(" - ", 1)
-                        elif not title:
-                            title = base
-                    dailyrec.record_online_play(
-                        user_guid,
-                        guid,
-                        {"guid": guid, "title": title, "artist": artist, "source": source_from_online_guid(guid)},
-                    )
+                for guid, snapshot in zip(online_plays, snapshots):
+                    if isinstance(snapshot, Exception):
+                        snapshot = {"guid": guid}
+                    _HISTORY_INFO_MISS.pop(guid, None)
+                    dailyrec.record_online_play(user_guid, guid, snapshot)
         elif auth_resp is not None and not other_events:
             return auth_resp
 
@@ -6116,6 +6268,77 @@ async def event_report(request: Request):
             media_type=resp.headers.get("content-type"),
         )
     return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+
+
+async def _repair_online_history(request: Request, user_guid: str,
+                                 items: list[dict]) -> list[dict]:
+    """修复历史里标题缺失/被写成内部缓存名的快照。
+
+    老版本把 online_netease_<id> 当标题落了盘；这些记录不会因为修好上报逻辑就
+    自己变好，读取时顺手修一次并持久化。本地缓存标签优先，网络只补少量未命中项，
+    避免拖慢「最近播放」。
+    """
+    repairs: dict[str, dict] = {}
+    unresolved: list[str] = []
+    for it in items:
+        guid = str(it.get("guid") or "")
+        if not guid:
+            continue
+        track = it.get("track") if isinstance(it.get("track"), dict) else {}
+        if not _history_title_missing(track):
+            continue
+        fixed = _history_track_with_cache(guid, track, _peek_online_info(guid))
+        if fixed != track:
+            repairs[guid] = fixed
+            it["track"] = fixed
+        if _history_title_missing(fixed):
+            unresolved.append(guid)
+
+    now = time.time()
+    targets: list[str] = []
+    for guid in reversed(unresolved):
+        if now - _HISTORY_INFO_MISS.get(guid, 0.0) < _HISTORY_INFO_MISS_TTL:
+            continue
+        targets.append(guid)
+        if len(targets) >= _HISTORY_REPAIR_MAX:
+            break
+
+    if targets:
+        results = await asyncio.gather(
+            *(asyncio.wait_for(_online_info(request, guid), timeout=_HISTORY_INFO_TIMEOUT_S)
+              for guid in targets),
+            return_exceptions=True,
+        )
+        by_guid = {str(it.get("guid") or ""): it for it in items}
+        for guid, info in zip(targets, results):
+            if isinstance(info, Exception) or not isinstance(info, dict):
+                # 下架/网络故障的曲目不要每次打开页面都给 musicbox 加压
+                _HISTORY_INFO_MISS[guid] = now
+                continue
+            item = by_guid.get(guid) or {}
+            track = item.get("track") if isinstance(item.get("track"), dict) else {}
+            fixed = _history_track_with_cache(guid, track, info)
+            if fixed != track:
+                repairs[guid] = fixed
+                item["track"] = fixed
+            _HISTORY_INFO_MISS.pop(guid, None)
+
+    if repairs:
+        async with _HISTORY_LOCK:
+            fresh = dailyrec.load_online_play_history(user_guid)
+            if fresh:
+                changed = False
+                for it in fresh:
+                    guid = str(it.get("guid") or "")
+                    fixed = repairs.get(guid)
+                    track = it.get("track") if isinstance(it.get("track"), dict) else {}
+                    if fixed and _history_title_missing(track):
+                        it["track"] = {**track, **fixed}
+                        changed = True
+                if changed:
+                    dailyrec.save_online_play_history(user_guid, fresh)
+                items = fresh
+    return items
 
 
 @app.get("/music/api/v1/play-history/list")
@@ -6143,6 +6366,7 @@ async def play_history_list(request: Request):
 
     async with _HISTORY_LOCK:
         online_items = dailyrec.load_online_play_history(user_guid)
+    online_items = await _repair_online_history(request, user_guid, online_items)
     online_tracks = []
     for it in reversed(online_items):
         guid = str(it.get("guid") or "")

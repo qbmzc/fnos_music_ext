@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from proxy import netease_auth, recommend as dailyrec
 from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value
-from proxy.app import build_online_track
+from proxy.app import _write_media_cache_meta, build_online_track
 
 DAILY_ROWS = [
     {
@@ -53,6 +53,7 @@ def setup_recommend_env(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", hist_dir)
     monkeypatch.setitem(CONF, "fav_dir", fav_dir)
     monkeypatch.setitem(CONF, "cache_dir", cache_dir)
+    monkeypatch.setitem(CONF, "media_cache_dir", str(tmp_path / "media-cache"))
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "daily_enabled", True)
     monkeypatch.setitem(CONF, "daily_limit", 20)
@@ -558,6 +559,153 @@ def test_play_history_merges_online(tmp_path, monkeypatch):
     assert "online:netease:99" in guids
     assert "local-track-1" in guids
     assert body["data"]["total"] == 2
+
+
+def _song_info_handler(info_by_id):
+    """musicbox 歌曲详情 mock；歌词固定返回空，聚焦标题/时长。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/api/v1/song/") and path.endswith("/info"):
+            song_id = path.split("/")[4]
+            data = info_by_id.get(song_id)
+            if data is None:
+                return httpx.Response(404, json={"ok": False})
+            return httpx.Response(200, json={"ok": True, "data": data})
+        if path.startswith("/api/v1/song/") and path.endswith("/lyric"):
+            return httpx.Response(200, json={"ok": True, "data": {"lyric": ""}})
+        return httpx.Response(404, json={"ok": False})
+    return handler
+
+
+def _wire_musicbox(monkeypatch, info_by_id):
+    _wire(monkeypatch)
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_song_info_handler(info_by_id)),
+        base_url="http://127.0.0.1:8770",
+    )
+
+
+def test_event_report_records_real_metadata(tmp_path, monkeypatch):
+    """v2.9.32 回归：最近播放曾把 online_netease_<id> 当歌名、时长恒 0。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    _wire_musicbox(monkeypatch, {
+        "12961": {
+            "name": "晴天",
+            "ar": [{"name": "周杰伦"}],
+            "al": {"name": "叶惠美", "picUrl": "https://pic/12961.jpg"},
+            "dt": 269000,
+            "h": {"size": 123456},
+        },
+    })
+    with TestClient(app) as client:
+        resp = client.post(
+            "/music/api/v1/event/report",
+            json={
+                "events": [
+                    {"eventType": "track_play", "occurredAt": 1,
+                     "payload": {"trackGUID": "online:netease:12961"}}
+                ]
+            },
+        )
+        assert resp.json()["code"] == 0
+
+    track = dailyrec.load_online_play_history("user-rec-1")[-1]["track"]
+    assert track["title"] == "晴天"
+    assert track["artist"] == "周杰伦"
+    assert track["duration_s"] == 269
+    assert "online_netease" not in track["title"]
+
+
+def test_play_history_repairs_internal_title_from_cache_meta(tmp_path, monkeypatch):
+    """已有异常记录（标题被写成缓存文件名、时长 0）读取时自动修复并落盘。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    guid = "online:netease:777"
+    audio = os.path.join(CONF["media_cache_dir"], "online_netease_777.mp3")
+    os.makedirs(CONF["media_cache_dir"], exist_ok=True)
+    with open(audio, "wb") as fh:
+        fh.write(b"ID3" + b"\0" * 256)
+    _write_media_cache_meta(guid, audio, "exhigh", {
+        "title": "缓存里的歌", "artist": "缓存歌手", "album": "缓存专辑", "duration_s": 200,
+    })
+    dailyrec.record_online_play("user-rec-1", guid, {
+        "guid": guid, "title": "online_netease_777", "artist": "", "source": "netease",
+    })
+
+    calls = []
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(404, json={"ok": False})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/play-history/list").json()
+
+    online = next(x for x in body["data"]["list"] if x["guid"] == guid)
+    assert online["title"] == "缓存里的歌"
+    assert online["duration"] == 200000
+    assert online["artists"][0]["name"] == "缓存歌手"
+    assert calls == [], "本地缓存已能补齐时不应再请求 musicbox"
+
+    stored = dailyrec.load_online_play_history("user-rec-1")[-1]["track"]
+    assert stored["title"] == "缓存里的歌"
+    assert stored["duration_s"] == 200
+
+
+def test_play_history_never_exposes_internal_cache_name(tmp_path, monkeypatch):
+    """缓存没有标签/元数据、上游也不可用时，宁可留空也不显示 online_netease_xxx。"""
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    guid = "online:netease:888"
+    audio = os.path.join(CONF["media_cache_dir"], "online_netease_888.mp3")
+    os.makedirs(CONF["media_cache_dir"], exist_ok=True)
+    with open(audio, "wb") as fh:
+        fh.write(b"not-a-real-audio" * 32)
+    dailyrec.record_online_play("user-rec-1", guid, {
+        "guid": guid, "title": "online_netease_888", "artist": "", "source": "netease",
+    })
+    _wire(monkeypatch)
+
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/play-history/list").json()
+    online = next(x for x in body["data"]["list"] if x["guid"] == guid)
+    assert "online_netease" not in str(online.get("title") or "")
+
+
+def test_play_history_repairs_from_embedded_tags(tmp_path, monkeypatch):
+    """真实缓存文件通常有 write_audio_tags 写的标签——没有再退回媒体索引。"""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not available")
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    guid = "online:netease:999"
+    audio = os.path.join(CONF["media_cache_dir"], "online_netease_999.mp3")
+    os.makedirs(CONF["media_cache_dir"], exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+         "-t", "0.3", "-q:a", "9", audio],
+        check=True, capture_output=True,
+    )
+    from proxy.app import write_audio_tags
+
+    write_audio_tags(audio, title="标签歌名", artist="标签歌手", album="标签专辑")
+    dailyrec.record_online_play("user-rec-1", guid, {
+        "guid": guid, "title": "online_netease_999", "artist": "", "source": "netease",
+    })
+    _wire(monkeypatch)
+
+    with TestClient(app) as client:
+        body = client.get("/music/api/v1/play-history/list").json()
+    online = next(x for x in body["data"]["list"] if x["guid"] == guid)
+    assert online["title"] == "标签歌名"
+    assert online["artists"][0]["name"] == "标签歌手"
+    assert online["duration"] > 0
 
 
 # ------------------------------------------------- playlist_list endpoint ----

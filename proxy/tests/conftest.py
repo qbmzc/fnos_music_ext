@@ -51,6 +51,8 @@ def _reset_online_info_caches():
     proxy_app._ONLINE_INFO_CACHE.clear()
     proxy_app._ONLINE_COVER_CACHE.clear()
     proxy_app._URL_CACHE.clear()
+    proxy_app._HISTORY_INFO_MISS.clear()
+    proxy_app._CACHE_TAG_INFO.clear()
     proxy_app._channel_recs_cache.clear()
     for task in list(proxy_app._channel_recs_refresh.values()):
         if task is not None and not task.done():
